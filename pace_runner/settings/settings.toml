@@ -1,0 +1,16 @@
+[default]
+now_iso = "@jinja {{this._get_now(this.tz)}}"
+start_ts = "@jinja {{this._get_start_ts(this.tz)}}"
+tz = "Asia/Kolkata"
+
+[default.output]
+base = "/home/limited_user/Data/cron_job_outputs"
+job_name = "default_job"
+job_queue = "@jinja {{this.output__base}}/{{this.output__job_name}}/job_queue"
+lock_timeout_sec = 10
+
+[default.logs]
+base = "/tmp/pace_runner_logs"
+enable_stream = false
+file = "@jinja {{this.logs__base}}/{{this.output__job_name}}/{{this._get_start_ts(this.tz).strftime('%Y-%m-%d_%H-%M-%S')}}.log"
+level = "INFO"

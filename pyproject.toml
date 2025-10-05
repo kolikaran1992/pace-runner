@@ -1,0 +1,20 @@
+[project]
+authors = [
+  {name = "kolikaran1992", email = "kolikaran1992@gmail.com"},
+]
+dependencies = [
+  "dynaconf (>=3.2.11,<4.0.0)",
+  "pytz (>=2025.2,<2026.0)",
+]
+description = "A simple, file-system-backed library to handle rate-limited job execution via cron."
+keywords = ["cron", "job-scheduler", "rate-limit", "job-queue"]
+license = "MIT"
+name = "pace-runner"
+packages = [{include = "pace_runner"}]
+readme = "README.md"
+requires-python = ">=3.10,<4.0"
+version = "0.1.0"
+
+[build-system]
+build-backend = "poetry.core.masonry.api"
+requires = ["poetry-core>=2.0.0,<3.0.0"]
