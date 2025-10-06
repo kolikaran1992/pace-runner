@@ -10,10 +10,12 @@
   * **Pluggable Messengers:** Get real-time updates and alerts for job completions or errors via **Slack, Email, File Log,** or any other custom messenger service.
   * **Local Persistence:** Uses the local file system for robust job data storage and file locks to ensure single-instance cron execution.
   * **Job Inspection:** Easily inspect the status, error messages, and retry count of all pending jobs.
+  * **Duplicate Job Skipping:** **Automatically skips the submission of duplicate jobs** based on a customizable comparison key within the job's payload.
 
 -----
 
 ## 🛠️ Installation
+
 ```bash
 pip install pace-runner
 ```
@@ -33,26 +35,47 @@ In this step, you define the job's **payload** (the data needed for the task) an
 ```python
 # main_application_script.py
 
+import random
 from pace_runner import BaseJobPayload, add_job
 from dataclasses import dataclass, field
 
 # 1. Define the custom job payload
 @dataclass
 class TempJobPayload(BaseJobPayload):
-    """Payload for a custom processing job."""
-    text: str = field(init=True)
+    """
+    Payload for a custom processing job.
+    
+    The 'compare=True' argument marks this field as part of the unique key
+    used to detect and skip duplicate jobs.
+    """
+    # This 'id' field will be used for duplicate check
+    item_id: str = field(init=True, compare=True)
+    
+    # This 'text' field will NOT be used for duplicate check
+    text_to_process: str = field(init=True, compare=False) 
 
 temp_path = "/tmp/job_outputs"
 
 # 2. Add jobs to the pending queue
-for idx in range(5):
-    add_job(
-        payload=TempJobPayload(text=f"Process this text item {idx}"), 
-        # The executor will save its JSON output to this path
-        output_path=f"{temp_path}/item_{idx}.json"
-    )
+# The first two jobs have the same 'item_id', so the second one will be skipped.
+jobs_to_submit = [
+    ("A001", "Initial text for item A001"),
+    ("A001", "Updated text for item A001 - THIS WILL BE SKIPPED"), # Duplicate ID
+    ("A002", "Text for item A002")
+]
 
-print(f"Submitted 5 jobs to the queue. They will be processed by the cron job.")
+submitted_count = 0
+for item_id, text in jobs_to_submit:
+    was_added = add_job(
+        payload=TempJobPayload(item_id=item_id, text_to_process=text), 
+        # The executor will save its JSON output to this path
+        output_path=f"{temp_path}/item_{item_id}.json"
+    )
+    if was_added:
+        submitted_count += 1
+
+print(f"Attempted to submit {len(jobs_to_submit)} jobs.")
+print(f"Submitted {submitted_count} unique jobs to the queue. They will be processed by the cron job.")
 ```
 
 -----
@@ -79,10 +102,10 @@ class TempJobExecutor(JobExecutorBase):
         print(f"Executing job: {job.id} with payload: {job.payload}")
         
         # --- PLACE YOUR RATE-LIMITED SERVICE CALL HERE ---
-        # e.g., result = tts_service.synthesize(job.payload.text)
+        # e.g., result = tts_service.synthesize(job.payload.text_to_process)
         
         # For this example, we'll just return the payload's data
-        return {"input_text": job.payload.text, "status": "completed"}
+        return {"input_id": job.payload.item_id, "processed_text": job.payload.text_to_process, "status": "completed"}
 
 # 2. Define the Messenger
 # This class sends alerts on errors and batch completion status.
@@ -112,6 +135,61 @@ Add the following entry to your crontab to run the script every five minutes:
 # PACE_RUNNER_SETTINGS_TOML is defined in configuration section below
 
 */5 * * * * PACE_RUNNER_SETTINGS_TOML=/path/to/custom_settings.toml /usr/bin/env python3 /path/to/your/cron_job.py
+```
+
+-----
+
+## ♻️ Duplicate Job Handling
+
+Pace Runner automatically determines if a new job being submitted is a duplicate of a currently pending job and, if so, **will skip the submission**. This prevents resource waste on jobs that have already been queued.
+
+### How Duplicates are Identified
+
+A job is considered a duplicate if the "compare key" generated from its payload is identical to one already in the queue.
+
+The compare key is generated from the fields in your `BaseJobPayload` dataclass that are explicitly marked with **`compare=True`**.
+
+#### **Customizing the Compare Key**
+
+You control which parts of your job data make a job unique by setting `compare=True` (for inclusion) or `compare=False` (for exclusion) on the dataclass fields.
+
+This comparison logic is also **recursive**, meaning you can define nested objects within your main payload and control their inclusion in the unique key.
+
+#### **Example of a Recursive Compare Key**
+
+In this example, the unique key will only be based on `TempJobPayload.id` and `ChildTempJobPayload.child_key`. Any change to `text` or `arr` will not result in a new job being submitted if the compare fields are the same.
+
+```python
+import random
+from dataclasses import dataclass, field
+from pace_runner import BaseJobPayload
+
+# 1. Define a nested payload object (does not need to inherit BaseJobPayload)
+@dataclass
+class ChildTempJobPayload:
+    # 'child_key' is included in the unique job key (compare=True)
+    child_key: str = field(
+        init=False, default_factory=lambda: random.choice(["key_A", "key_B"]), compare=True
+    )
+
+# 2. Define the main job payload
+@dataclass
+class TempJobPayload(BaseJobPayload):
+    # 'text' is NOT included in the unique job key (compare=False)
+    text: str = field(init=True, compare=False)
+    
+    # 'arr' is NOT included in the unique job key (compare=False)
+    arr: list = field(init=True, compare=False)
+    
+    # 'id' IS included in the unique job key (compare=True)
+    id: str = field(init=False, default="hello", compare=True)
+    
+    # 'child' is an object whose compare=True fields will be used recursively
+    child: ChildTempJobPayload = field(init=False, default_factory=ChildTempJobPayload)
+
+# A job with id="hello", text="new", arr=[1], and child.child_key="key_A"
+# will be a duplicate of a job with id="hello", text="old", arr=[2], and child.child_key="key_A".
+# The fields marked 'compare=False' are safely ignored for the duplicate check.
 ```
 
 -----
