@@ -4,12 +4,12 @@ from typing import Dict, Any, List
 from abc import abstractmethod
 
 from pace_runner.settings import logger
-from pace_runner.job_manager.lock_manager import cron_process_lock
+from pace_runner.job_manager.lock_manager import _cron_process_lock
 from pace_runner.job_manager.queue import (
     get_pending_jobs,
-    update_job_status,
-    mark_job_complete,
-    move_to_failed,
+    _update_job_status,
+    _mark_job_complete,
+    _move_to_failed,
 )
 from pace_runner.job_manager.schema import JobStatus, SystemJobPayload
 from pace_runner.messenger import MessengerBase
@@ -68,7 +68,7 @@ class JobExecutorBase:
         try:
             with open(output_path, "w") as f:
                 json.dump(result, f, indent=4)
-            logger.info(
+            logger.debug(
                 f"Successfully saved output for Job ID {job.job_id} to {output_path}"
             )
         except Exception as e:
@@ -86,7 +86,7 @@ class JobExecutorBase:
         failed_jobs: int = 0
 
         # 1. Global Lock: Ensure single-instance execution
-        with cron_process_lock():
+        with _cron_process_lock():
             logger.info("Cron lock acquired. Starting job execution cycle.")
 
             # 2. Job Retrieval: Get all runnable jobs
@@ -97,10 +97,10 @@ class JobExecutorBase:
             for job in jobs_to_process:
                 processed_jobs += 1
                 try:
-                    logger.info(f"Processing Job ID: {job.job_id}")
+                    logger.debug(f"Processing Job ID: {job.job_id}")
 
                     # Mark job as processing
-                    update_job_status(job.job_id, JobStatus.processing)
+                    _update_job_status(job.job_id, JobStatus.processing)
 
                     # Call the abstract execution logic
                     result: Dict[str, Any] = self._execute_handler_logic(job)
@@ -109,7 +109,7 @@ class JobExecutorBase:
                     self._save_output(job, result)
 
                     # Mark job as complete and delete the entry/file
-                    mark_job_complete(job.job_id)
+                    _mark_job_complete(job.job_id)
                     completed_jobs += 1
 
                     logger.info(f"Job ID {job.job_id} successfully completed.")
@@ -132,7 +132,7 @@ class JobExecutorBase:
                     )
 
                     # Move the job to the failed queue
-                    move_to_failed(job.job_id, tb.format_exc())
+                    _move_to_failed(job.job_id, tb.format_exc())
 
             logger.info(
                 f"Execution cycle finished. Processed: {processed_jobs}, Completed: {completed_jobs}, Failed: {failed_jobs}."

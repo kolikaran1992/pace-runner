@@ -8,6 +8,8 @@ base = "/home/limited_user/Data/cron_job_outputs"
 job_name = "default_job"
 job_queue = "@jinja {{this.output__base}}/{{this.output__job_name}}/job_queue"
 lock_timeout_sec = 10
+hash_input_length = 100
+paylod_string_division = 4
 
 [default.logs]
 base = "/tmp/pace_runner_logs"

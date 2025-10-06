@@ -1,5 +1,4 @@
-import fcntl
-import time
+import time, shutil, fcntl, os
 from contextlib import contextmanager
 from pace_runner.settings import config, logger
 from pathlib import Path
@@ -18,121 +17,137 @@ except Exception as e:
     logger.exception(f"Error creating base directory {config.output__base}: {e}")
 
 
-@contextmanager
-def cron_process_lock():
+def _safe_remove_dir(dir_path: str) -> bool:
     """
-    Context manager for the CRON PROCESS LOCK.
-    This lock prevents the cron scheduler from running two instances
-    of the job_executor simultaneously. This is the 'global' lock.
+    Attempts to remove a directory and all its contents, acquiring a non-blocking lock
+    on a lock file inside the directory to prevent race conditions.
 
-    Configuration: Uses config.output__base (jobs directory) and
-                   config.output__lock_timeout_sec (timeout).
-
-    Usage:
-    from lock_manager import cron_process_lock
-    with cron_process_lock():
-        # Code here runs exclusively
-        ...
+    :param dir_path: Path to the directory to remove.
+    :return: True if the directory was successfully removed, False if locked.
     """
-    jobs_dir = config.output__base
-    timeout = config.output__lock_timeout_sec
-    # Use Path objects for cleaner path construction
-    lock_file_path = Path(jobs_dir).joinpath(".cron_lock").as_posix()
+    dir_path = Path(dir_path)
+    if not dir_path.exists() or not dir_path.is_dir():
+        return True  # Already gone, treat as success
 
-    # 1. Open the file handle
-    try:
-        # Open in write mode, creating if it doesn't exist.
-        f = open(lock_file_path, "w")
-    except OSError as e:
-        logger.exception(f"Error opening lock file {lock_file_path}: {e}")
-        raise
-
-    lock_acquired = False
-    try:
-        # 2. Try to acquire the lock (LOCK_EX = exclusive lock, LOCK_NB = non-blocking)
-        # We use a non-blocking lock inside a loop to implement the timeout.
-        start_time = time.time()
-
-        while time.time() < start_time + timeout:
-            try:
-                # Attempt a non-blocking lock
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                lock_acquired = True
-                break
-            except BlockingIOError:
-                # Lock is held, wait a short period and retry
-                time.sleep(0.1)
-
-        if not lock_acquired:
-            raise TimeoutError(
-                f"Could not acquire cron process lock within {timeout} seconds."
-            )
-
-        # Log successful acquisition
-        logger.info("CRON LOCK: Acquired exclusive process lock.")
-
-        # 3. Yield control to the 'with' block
-        yield
-
-    finally:
-        # 4. Release the lock and close the file handle
-        if lock_acquired:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-            # Log successful release
-            logger.info("CRON LOCK: Released exclusive process lock.")
-        f.close()
-
-
-@contextmanager
-def job_file_lock(job_id: str):
-    """
-    Context manager for a JOB FILE LOCK.
-    This lock ensures atomic read/write operations on a specific job file.
-
-    Configuration: Uses config.output__base (jobs directory).
-
-    Usage:
-    from lock_manager import job_file_lock
-    with job_file_lock('job_xyz') as f:
-        # Safely read/write job_xyz.json using file handle 'f'
-        ...
-    """
-    jobs_dir = config.output__job_queue
-    job_file_path = Path(jobs_dir).joinpath(f"{job_id}.json").as_posix()
-
-    # This lock needs to be acquired quickly or the operation fails,
-    # as the cron lock handles overall scheduling.
-
-    # We open outside the lock attempt but inside the context manager scope
-    # to handle the FileNotFoundError gracefully.
-    f = None
-    try:
-        # Note: Must exist for r+, but queue manager handles creation
-        f = open(job_file_path, "r+")
-    except FileNotFoundError:
-        # This is expected if the file hasn't been written yet (e.g., in submit_job)
-        # Or if it was just completed/deleted. We can't lock a non-existent file.
-        raise FileNotFoundError(f"Cannot lock file: {job_file_path} not found.")
+    lock_file = dir_path / ".lock"  # hidden lock file
+    lock_file.touch(exist_ok=True)
 
     try:
-        # Try a non-blocking lock for immediate access
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with open(lock_file, "r+") as f:
+            # Attempt non-blocking exclusive lock
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
-        # Log successful acquisition
-        logger.debug(f"JOB LOCK: Acquired lock for job ID: {job_id}")
-
-        yield f  # Yield the file handle itself for atomic read/write
+            # Lock acquired, safe to remove directory recursively
+            shutil.rmtree(dir_path)
+            return True
 
     except BlockingIOError:
-        raise BlockingIOError(
-            f"Job file lock for {job_id} is currently held by another process."
+        # Lock is held by another process
+        return False
+    except Exception as e:
+        # Log or re-raise depending on your needs
+        raise RuntimeError(f"Failed to remove directory {dir_path}: {e}")
+
+
+@contextmanager
+def _cron_process_lock():
+    cron_file_path = Path(config.output.base).joinpath(".cron_lock").as_posix()
+    with _safe_open(
+        cron_file_path,
+        "w",
+        timeout=config.output.lock_timeout_sec,
+        create_dirs=True,
+    ) as f:
+        # If we reached here, cron lock acquired
+        yield f
+
+
+@contextmanager
+def _safe_open(
+    file,
+    mode="r",
+    buffering=-1,
+    encoding=None,
+    errors=None,
+    newline=None,
+    closefd=True,
+    opener=None,
+    *,
+    blocking=False,
+    timeout=0,
+    create_dirs=False,
+):
+    """
+    Universal file opener with built-in file locking.
+
+    Works exactly like built-in `open()`, but adds:
+      - automatic flock-based locking
+      - optional timeout or non-blocking mode
+      - optional directory creation
+      - raises FileNotFoundError if file does not exist (for read modes)
+
+    Args:
+        file (str or Path): Path to the file.
+        mode (str): Same as `open()`.
+        blocking (bool): If False, raises immediately if file locked.
+        timeout (int): Max seconds to wait for lock if blocking=True.
+        create_dirs (bool): If True, auto-creates parent directories.
+
+    Usage:
+        >>> with safe_open("data.txt", "a+") as f:
+        ...     f.write("Hello, world")
+    """
+    path = Path(file)
+    if create_dirs:
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    # --- Validate file existence if read mode ---
+    if not path.is_file() and not any(m in mode for m in ("w", "a", "x")):
+        raise FileNotFoundError(f"Cannot open '{path}': file does not exist.")
+
+    # --- Open file ---
+    try:
+        f = open(path, mode, buffering, encoding, errors, newline, closefd, opener)
+    except FileNotFoundError:
+        # Catch any remaining edge cases (e.g., race conditions)
+        raise FileNotFoundError(f"Cannot open '{path}': file not found.")
+
+    start_time = time.time()
+    locked = False
+
+    try:
+        # Exclusive lock for write modes, shared for read-only
+        lock_type = (
+            fcntl.LOCK_EX if any(m in mode for m in ("w", "a", "+")) else fcntl.LOCK_SH
         )
 
+        while True:
+            try:
+                flags = lock_type
+                if not blocking:
+                    flags |= fcntl.LOCK_NB
+                fcntl.flock(f.fileno(), flags)
+                locked = True
+                logger.debug(
+                    f"LOCK: Acquired {'exclusive' if lock_type == fcntl.LOCK_EX else 'shared'} lock on {path}"
+                )
+                break
+            except BlockingIOError:
+                if not blocking:
+                    raise BlockingIOError(f"File is locked: {path}")
+                if time.time() - start_time > timeout:
+                    raise TimeoutError(f"Timeout waiting for lock: {path}")
+                time.sleep(0.1)
+
+        yield f  # Give back the open file handle safely
+
     finally:
-        # Only attempt to release/close if the file was successfully opened
-        if f:
-            # Release the lock and close the file handle
+        if locked:
+            try:
+                f.flush()
+                os.fsync(f.fileno())
+            except Exception:
+                pass  # flush may fail in read mode — ignore
             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-            # Log successful release
-            logger.debug(f"JOB LOCK: Released lock for job ID: {job_id}")
-            f.close()
+            logger.debug(f"LOCK: Released lock on {path}")
+        f.close()
