@@ -17,6 +17,10 @@ from pace_runner.messenger import MessengerBase
 import traceback as tb
 
 
+class SaveFailedException(Exception):
+    pass
+
+
 class JobExecutorBase:
     """
     The central worker component of PaceRunner. It is responsible for locking the process,
@@ -52,7 +56,7 @@ class JobExecutorBase:
     def _save_output(self, job: SystemJobPayload, result: Dict[str, Any]) -> None:
         """
         Saves the execution result dictionary to the specified job.output_path.
-
+        NOTE: Assume the result to be a dictionary
         Args:
             job: The SystemJobPayload object containing the output_path.
             result: The dictionary of data to be saved (the API response).
@@ -60,6 +64,9 @@ class JobExecutorBase:
         Raises:
             IOError: If there is an issue writing the file.
         """
+        if not isinstance(result, dict):
+            raise Exception(f"The result is not a dict for job: {job.job_id}")
+
         output_path = Path(job.output_path)
 
         # Ensure the parent directory exists
@@ -73,7 +80,7 @@ class JobExecutorBase:
             )
         except Exception as e:
             logger.error(f"Failed to save output for Job ID {job.job_id}: {e}")
-            raise IOError(f"Error saving output to {output_path}: {e}")
+            raise SaveFailedException(f"Error saving output to {output_path}: {e}")
 
     # --- 5. Main Execution Entry Point ---
     def run_cron_job(self) -> None:
@@ -122,18 +129,25 @@ class JobExecutorBase:
                         exc_info=True,
                     )
 
-                    # Send an immediate Alert
-                    alert_message = (
-                        f"🚨 PaceRunner Job Execution Failed! 🚨\n"
-                        f"Error: `{type(e).__name__}: {str(e)}`"
-                    )
+                    if isinstance(e, SaveFailedException):
+                        # Send an immediate Alert
+                        alert_message = (
+                            f"🚨 PaceRunner Stopped Abruptly\n"
+                            f"breaking the cron-job since there seems to be a problem with result saving"
+                        )
+                    else:
+                        alert_message = (
+                            f"🚨 PaceRunner Job Execution Failed! 🚨\n"
+                            f"Error: `{type(e).__name__}: {str(e)}`"
+                        )
                     self.messenger.send_alert(
                         "Job Execution Failure", job.job_id, alert_message
                     )
 
                     # Move the job to the failed queue
                     _move_to_failed(job.job_id, tb.format_exc())
-
+                    if isinstance(e, SaveFailedException):
+                        break
             logger.info(
                 f"Execution cycle finished. Processed: {processed_jobs}, Completed: {completed_jobs}, Failed: {failed_jobs}."
             )
