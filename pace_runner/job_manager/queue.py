@@ -8,6 +8,10 @@ from pace_runner.settings import config, logger
 # Assuming these schemas are available in the runtime environment
 from pace_runner.job_manager.schema import SystemJobPayload, JobPayloadBase, JobStatus
 from pace_runner.job_manager.lock_manager import _safe_open, _safe_remove_dir
+from pace_runner.job_manager.payload_hash import (
+    _calculate_payload_hash_key,
+    _get_canonical_unique_string,
+)
 
 
 # --- STATIC CONFIGURATION PATHS ---
@@ -180,6 +184,20 @@ def _mark_job_complete(job_id: str) -> None:
         )
 
 
+def _move_to_failed(job_id: str, error_message: str) -> None:
+    """
+    Marks a job as failed and appends an error message.
+    """
+    try:
+        _update_job_status(job_id, JobStatus.failed, error_message)
+        logger.warning(f"Job {job_id} marked as failed. Error: {error_message}")
+    except FileNotFoundError:
+        logger.warning(f"Failed to mark job {job_id} as failed: file not found.")
+    except Exception as e:
+        logger.exception(f"Unexpected error marking job {job_id} as failed: {e}")
+        raise
+
+
 # --- QUEUE MANAGEMENT FUNCTIONS ---
 
 
@@ -249,40 +267,6 @@ def clean_job_queue() -> int:
     _safe_remove_dir(JOBS_DIR)
     logger.warning(f"Cleared everything from the job queue")
 
-    # job_ids = _get_jobs_in_queue()
-    # removed_count = 0
-
-    # # Clear index first for atomic index reset
-    # _write_job_index({})
-
-    # for job_id in job_ids:
-    #     try:
-    #         # File removal helper (also attempts to remove folder)
-    #         _remove_job_file_and_folder(job_id)
-    #         removed_count += 1
-    #     except BlockingIOError:
-    #         logger.warning(f"Skipping removal of job {job_id}: file is locked.")
-    #     except Exception:
-    #         # Skip if error during file removal but continue to next job
-    #         continue
-
-    # logger.warning(f"All jobs removed. Total: {removed_count}")
-    # return removed_count
-
-
-def _move_to_failed(job_id: str, error_message: str) -> None:
-    """
-    Marks a job as failed and appends an error message.
-    """
-    try:
-        _update_job_status(job_id, JobStatus.failed, error_message)
-        logger.warning(f"Job {job_id} marked as failed. Error: {error_message}")
-    except FileNotFoundError:
-        logger.warning(f"Failed to mark job {job_id} as failed: file not found.")
-    except Exception as e:
-        logger.exception(f"Unexpected error marking job {job_id} as failed: {e}")
-        raise
-
 
 def add_job(payload: JobPayloadBase, output_path: str) -> str:
     """
@@ -293,11 +277,12 @@ def add_job(payload: JobPayloadBase, output_path: str) -> str:
     :param output_path: Path where API output should be saved.
     :return: The generated job_id string, or ID of an existing duplicate job.
     """
-    hash_key = payload._hash_key
+    new_job_hash_key = payload._hash_key
+    new_job_pld_string = _get_canonical_unique_string(payload, payload)
 
     # Use _create_job_file_path to derive the hash folder path needed for the glob check.
     # We use a dummy ID and get the parent to avoid introducing a new helper.
-    hash_folder = _create_job_file_path(hash_key, "dummy_id").parent
+    hash_folder = _create_job_file_path(new_job_hash_key, "dummy_id").parent
 
     # Ensure hash folder exists (done defensively here, but also handled by _save_job)
     hash_folder.mkdir(parents=True, exist_ok=True)
@@ -307,23 +292,26 @@ def add_job(payload: JobPayloadBase, output_path: str) -> str:
         try:
             # We must use safe_open for the read lock during the check
             with _safe_open(job_file, "r") as f:
-                existing_job = SystemJobPayload(**json.load(f))
+                same_hash_system_job = SystemJobPayload(**json.load(f))
             # Compare payloads for duplicate
             # Must reconstruct the specific payload type for correct comparison
-            if existing_job.payload["_hash_key"] == payload._hash_key:
+            same_hash_pld_unique_string = _get_canonical_unique_string(
+                same_hash_system_job.payload, payload
+            )
+            if same_hash_pld_unique_string == new_job_pld_string:
                 logger.info(
-                    f"DUPLICATE JOB SKIPPED: Payload hash '{hash_key}' already present "
-                    f"as job '{existing_job.job_id}'."
+                    f"DUPLICATE JOB SKIPPED: Payload hash '{same_hash_pld_unique_string}' already present "
+                    f"as job '{same_hash_system_job.job_id}'."
                 )
-                return existing_job.job_id
+                return same_hash_system_job.job_id
         except (FileNotFoundError, json.JSONDecodeError, BlockingIOError):
             # Skip corrupted or currently locked files
             continue
 
     # --- Create and save new job ---
-    system_job = SystemJobPayload(payload=payload.get_dict(), output_path=output_path)
+    system_job = SystemJobPayload(payload=asdict(payload), output_path=output_path)
     # Use the new path creation helper to get the final path for logging
-    job_path = _create_job_file_path(hash_key, system_job.job_id)
+    job_path = _create_job_file_path(new_job_hash_key, system_job.job_id)
 
     try:
         # Use the reusable _save_job helper for atomic save and index update
