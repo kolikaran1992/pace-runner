@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Dict, Any, List
 from abc import abstractmethod
 
-from pace_runner.settings import logger
+from pace_runner.settings import logger, config
 from pace_runner.job_manager.lock_manager import _cron_process_lock
 from pace_runner.job_manager.queue import (
     get_pending_jobs,
@@ -97,8 +97,13 @@ class JobExecutorBase:
             logger.info("Cron lock acquired. Starting job execution cycle.")
 
             # 2. Job Retrieval: Get all runnable jobs
-            jobs_to_process: List[SystemJobPayload] = get_pending_jobs()
+            jobs_to_process: List[SystemJobPayload] = sorted(
+                get_pending_jobs(), key=lambda x: x.created_at
+            )
             logger.info(f"Found {len(jobs_to_process)} jobs to process.")
+
+            jobs_to_process = jobs_to_process[: config.get("batch_size")]
+            logger.info(f'running first {config.get("batch_size")} jobs')
 
             # 3. Loop & Execute
             for job in jobs_to_process:
