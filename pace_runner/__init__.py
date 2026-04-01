@@ -13,7 +13,7 @@ from .job_manager import (
     add_job,
     get_job_payload,
     get_pending_jobs,
-    remove_all_jobs,
+    clean_job_queue,
     remove_job_by_id,
 )
 from .messenger import MessengerBase
@@ -28,7 +28,7 @@ __all__ = [
     "SystemJobPayload",
     "get_job_payload",
     "get_pending_jobs",
-    "remove_all_jobs",
+    "clean_job_queue",
     "remove_job_by_id",
     # Executor and Messenger
     "JobExecutorBase",

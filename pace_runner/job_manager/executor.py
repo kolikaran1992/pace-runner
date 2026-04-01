@@ -3,18 +3,22 @@ from pathlib import Path
 from typing import Dict, Any, List
 from abc import abstractmethod
 
-from pace_runner.settings import logger
-from pace_runner.job_manager.lock_manager import cron_process_lock
+from pace_runner.settings import logger, config
+from pace_runner.job_manager.lock_manager import _cron_process_lock
 from pace_runner.job_manager.queue import (
     get_pending_jobs,
-    update_job_status,
-    mark_job_complete,
-    move_to_failed,
+    _update_job_status,
+    _mark_job_complete,
+    _move_to_failed,
 )
 from pace_runner.job_manager.schema import JobStatus, SystemJobPayload
 from pace_runner.messenger import MessengerBase
 
 import traceback as tb
+
+
+class SaveFailedException(Exception):
+    pass
 
 
 class JobExecutorBase:
@@ -52,7 +56,7 @@ class JobExecutorBase:
     def _save_output(self, job: SystemJobPayload, result: Dict[str, Any]) -> None:
         """
         Saves the execution result dictionary to the specified job.output_path.
-
+        NOTE: Assume the result to be a dictionary
         Args:
             job: The SystemJobPayload object containing the output_path.
             result: The dictionary of data to be saved (the API response).
@@ -60,6 +64,9 @@ class JobExecutorBase:
         Raises:
             IOError: If there is an issue writing the file.
         """
+        if not isinstance(result, dict):
+            raise Exception(f"The result is not a dict for job: {job.job_id}")
+
         output_path = Path(job.output_path)
 
         # Ensure the parent directory exists
@@ -68,12 +75,12 @@ class JobExecutorBase:
         try:
             with open(output_path, "w") as f:
                 json.dump(result, f, indent=4)
-            logger.info(
+            logger.debug(
                 f"Successfully saved output for Job ID {job.job_id} to {output_path}"
             )
         except Exception as e:
             logger.error(f"Failed to save output for Job ID {job.job_id}: {e}")
-            raise IOError(f"Error saving output to {output_path}: {e}")
+            raise SaveFailedException(f"Error saving output to {output_path}: {e}")
 
     # --- 5. Main Execution Entry Point ---
     def run_cron_job(self) -> None:
@@ -86,21 +93,26 @@ class JobExecutorBase:
         failed_jobs: int = 0
 
         # 1. Global Lock: Ensure single-instance execution
-        with cron_process_lock():
+        with _cron_process_lock():
             logger.info("Cron lock acquired. Starting job execution cycle.")
 
             # 2. Job Retrieval: Get all runnable jobs
-            jobs_to_process: List[SystemJobPayload] = get_pending_jobs()
+            jobs_to_process: List[SystemJobPayload] = sorted(
+                get_pending_jobs(), key=lambda x: x.created_at
+            )
             logger.info(f"Found {len(jobs_to_process)} jobs to process.")
+
+            jobs_to_process = jobs_to_process[: config.get("batch_size")]
+            logger.info(f'running first {config.get("batch_size")} jobs')
 
             # 3. Loop & Execute
             for job in jobs_to_process:
                 processed_jobs += 1
                 try:
-                    logger.info(f"Processing Job ID: {job.job_id}")
+                    logger.debug(f"Processing Job ID: {job.job_id}")
 
                     # Mark job as processing
-                    update_job_status(job.job_id, JobStatus.processing)
+                    _update_job_status(job.job_id, JobStatus.processing)
 
                     # Call the abstract execution logic
                     result: Dict[str, Any] = self._execute_handler_logic(job)
@@ -109,7 +121,7 @@ class JobExecutorBase:
                     self._save_output(job, result)
 
                     # Mark job as complete and delete the entry/file
-                    mark_job_complete(job.job_id)
+                    _mark_job_complete(job.job_id)
                     completed_jobs += 1
 
                     logger.info(f"Job ID {job.job_id} successfully completed.")
@@ -122,18 +134,25 @@ class JobExecutorBase:
                         exc_info=True,
                     )
 
-                    # Send an immediate Alert
-                    alert_message = (
-                        f"🚨 PaceRunner Job Execution Failed! 🚨\n"
-                        f"Error: `{type(e).__name__}: {str(e)}`"
-                    )
+                    if isinstance(e, SaveFailedException):
+                        # Send an immediate Alert
+                        alert_message = (
+                            f"🚨 PaceRunner Stopped Abruptly\n"
+                            f"breaking the cron-job since there seems to be a problem with result saving"
+                        )
+                    else:
+                        alert_message = (
+                            f"🚨 PaceRunner Job Execution Failed! 🚨\n"
+                            f"Error: `{type(e).__name__}: {str(e)}`"
+                        )
                     self.messenger.send_alert(
                         "Job Execution Failure", job.job_id, alert_message
                     )
 
                     # Move the job to the failed queue
-                    move_to_failed(job.job_id, tb.format_exc())
-
+                    _move_to_failed(job.job_id, tb.format_exc())
+                    if isinstance(e, SaveFailedException):
+                        break
             logger.info(
                 f"Execution cycle finished. Processed: {processed_jobs}, Completed: {completed_jobs}, Failed: {failed_jobs}."
             )

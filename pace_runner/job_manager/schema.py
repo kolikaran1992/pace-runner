@@ -5,16 +5,25 @@ from datetime import datetime
 
 
 from pace_runner.settings import config, logger
+from pace_runner.job_manager.payload_hash import _calculate_payload_hash_key
+
+import hashlib
+import json
+from dataclasses import dataclass, field, fields, asdict
+from typing import Any, List, Dict
 
 
 @dataclass
-class JobPayloadBase(ABC):
+class JobPayloadBase:
     """
     Abstract base class for all API-specific job parameters.
     User-defined payload dataclasses must inherit from this.
     """
 
-    pass
+    _hash_key: str = field(init=False, compare=False)
+
+    def __post_init__(self) -> None:
+        self._hash_key = _calculate_payload_hash_key(self)
 
 
 @dataclass(frozen=True)
